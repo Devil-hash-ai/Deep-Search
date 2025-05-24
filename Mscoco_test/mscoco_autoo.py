@@ -78,7 +78,7 @@ def build_faiss_index(img_ids, index_path=FAISS_INDEX_PATH):
 
 
 
-print("⚠️ Rebuilding FAISS index to ensure consistency...")
+print(" Rebuilding FAISS index to ensure consistency...")
 build_faiss_index(valid_img_ids)
 
 
@@ -94,7 +94,7 @@ def clip_faiss_topk(query_text, k=TOP_K_CLIP):
     text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
     text_vec = text_feat.cpu().numpy().astype(np.float32)
     D, I = faiss_index.search(text_vec, k)
-    print(f"🔍 FAISS search got indices: {I[0]}")
+    print(f" FAISS search got indices: {I[0]}")
     return [int(imgid_list[i]) for i in I[0] if i != -1]
 
 
