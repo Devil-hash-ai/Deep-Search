@@ -29,7 +29,6 @@ image_id_to_path = {
 valid_img_ids = [img_id for img_id, path in image_id_to_path.items() if os.path.exists(path)]
 print(f"Valid images: {len(valid_img_ids)}")
 
-@torch.no_grad()
 def build_faiss_index(img_ids, index_path=FAISS_INDEX_PATH):
     d = 512  
     index = faiss.IndexFlatIP(d)  
@@ -48,11 +47,11 @@ def build_faiss_index(img_ids, index_path=FAISS_INDEX_PATH):
         except Exception as e:
             print(f"[WARN] Failed: {path} - {e}")
 
-    print(f"✅ Built Faiss index with {index.ntotal} vectors.")
+    print(f" Built Faiss index with {index.ntotal} vectors.")
 
     faiss.write_index(index, index_path)
     np.save(index_path + ".ids.npy", np.array(imgid_list))
-    print(f"✅ Saved index to: {index_path} (+ .ids.npy)")
+    print(f" Saved index to: {index_path} (+ .ids.npy)")
 
 if not os.path.exists(FAISS_INDEX_PATH):
     build_faiss_index(valid_img_ids)
