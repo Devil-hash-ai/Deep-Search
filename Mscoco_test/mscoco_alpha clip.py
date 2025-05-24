@@ -76,7 +76,7 @@ def build_faiss_index_alpha(img_ids, index_path=FAISS_INDEX_PATH):
 
     faiss.write_index(index, index_path)
     np.save(index_path + ".ids.npy", np.array(imgid_list))
-    print(f"✅ Saved index to: {index_path} (+ .ids.npy)")
+    print(f" Saved index to: {index_path} (+ .ids.npy)")
 
 if not os.path.exists(FAISS_INDEX_PATH):
     build_faiss_index_alpha(valid_img_ids)
