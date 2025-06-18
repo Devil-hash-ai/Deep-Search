@@ -6,8 +6,30 @@ import argparse
 import numpy as np
 import faiss
 from dataset.webqa_dataset import WebQAMaskDataset
-import alpha_clip  # Load pre-trained alpha_clip model
+import alpha_clip  
 from trainer.a_trainer import CLIP_Clean_Train
+
+def custom_collate_fn(batch):
+    batch_images = torch.stack([item['image'] for item in batch])
+    batch_masks = torch.stack([item['mask'] for item in batch])
+    batch_captions = [item['caption'] for item in batch]
+    batch_prompts = [item['prompt'] for item in batch]
+    batch_image_ids = [item['image_id'] for item in batch]
+    batch_mask_info = [item['mask_info'] for item in batch]
+
+    text_input = alpha_clip.tokenize(
+        batch_captions, context_length=77, truncate=True
+    )
+
+    return {
+        'image': batch_images,
+        'mask': batch_masks,
+        'caption': batch_captions,
+        'prompt': batch_prompts,
+        'image_id': batch_image_ids,
+        'mask_info': batch_mask_info,
+        'text_input': text_input
+    }
 
 def setup_distributed(backend="nccl", port="29501"):
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -24,11 +46,27 @@ def setup_distributed(backend="nccl", port="29501"):
     return local_rank
 
 def train_main(args, local_rank):
-    dataset = WebQAMaskDataset(root_dir=args.data_root)
-    sampler = DistributedSampler(dataset, shuffle=True)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size // dist.get_world_size(), sampler=sampler, num_workers=4, pin_memory=True)
+    device = torch.device(f"cuda:{local_rank}")
 
-    model, _ = alpha_clip.load("ViT-L/14@336px", device='cpu', lora_adapt=False, rank=-1)
+    dataset = WebQAMaskDataset(root_dir=args.data_root, image_size=(336, 336))
+    sampler = DistributedSampler(dataset, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size // dist.get_world_size(),
+        sampler=sampler,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=custom_collate_fn
+    )
+
+    model, _ = alpha_clip.load(
+        "ViT-L/14@336px", device=device, lora_adapt=False, rank=-1
+    )
+    model = model.to(device)
+
+
+    for name, param in model.named_parameters():
+        assert param.device.type == 'cuda', f"[Error] Model param '{name}' on {param.device}, expected CUDA"
 
     trainer = CLIP_Clean_Train(
         model=model,
@@ -39,30 +77,30 @@ def train_main(args, local_rank):
         para_gamma=args.para_gamma,
         exp_name=args.exp_name,
         warmup_length=args.warmup_length,
-        epoch_num=args.epoch_num
+        epoch_num=args.epoch_num,
+        amp=args.amp
     )
 
     trainer.train_webqa(
         dataloader=dataloader,
         resume=args.resume,
-        amp=args.amp,
         warmup_length=args.warmup_length
     )
 
     if dist.get_rank() == 0:
         final_ckpt_path = os.path.join(args.data_root, "webqa_alpha.pth")
         torch.save(trainer.model.module.state_dict(), final_ckpt_path)
-        print(f" Final model saved to {final_ckpt_path}")
+        print(f"Final model saved to {final_ckpt_path}")
 
 def test_main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, _ = alpha_clip.load("ViT-L/14@336px", device='cpu', lora_adapt=False, rank=-1)
+    model, _ = alpha_clip.load("ViT-L/14@336px", device='cuda', lora_adapt=False, rank=-1, dtype=torch.float16)
     model.load_state_dict(torch.load(args.ckpt, map_location=device))
     model = model.to(device)
     model.eval()
 
     with torch.no_grad():
-        text_input = alpha_clip.tokenize([args.query_text]).to(device)
+        text_input = alpha_clip.tokenize([args.query_text], context_length=77, pad=True, truncate=True).to(device)
         text_feat = model.encode_text(text_input)
         text_feat /= text_feat.norm(dim=-1, keepdim=True)
 
