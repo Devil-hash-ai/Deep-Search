@@ -7,8 +7,6 @@ import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-from transformers import AutoTokenizer
-
 
 def cosine_lr(optimizer, base_lr, warmup_length, steps, para_gamma=1.0):
     def lr_lambda(current_step):
@@ -35,7 +33,8 @@ class CLIP_Clean_Train:
         exp_name="auto",
         warmup_length=200,
         epoch_num=4,
-        subnum=10000
+        subnum=10000,
+        amp=True
     ):
         self.local_rank = local_rank
         torch.cuda.set_device(local_rank)
@@ -64,10 +63,13 @@ class CLIP_Clean_Train:
 
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=weigth_decay)
         self.scheduler = None
-        self.scaler = GradScaler()
-        self.tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 
-    def train_webqa(self, dataloader, resume=False, amp=False, warmup_length=200):
+        self.use_amp = amp and torch.cuda.is_available()
+        self.scaler = GradScaler(enabled=self.use_amp)
+
+        print(f"[INFO] AMP enabled: {self.use_amp}, device: {torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}")
+
+    def train_webqa(self, dataloader, resume=False, warmup_length=200):
         self.scheduler = cosine_lr(
             self.optimizer, base_lr=self.lr,
             warmup_length=warmup_length,
@@ -85,18 +87,20 @@ class CLIP_Clean_Train:
             for batch in loop:
                 images = batch['image'].cuda(non_blocking=True)
                 masks = batch['mask'].cuda(non_blocking=True)
-                captions = batch['caption']
-                texts = self.tokenize(captions).cuda()
+                texts = batch['text_input'].cuda(non_blocking=True)
 
                 self.optimizer.zero_grad()
-                self.scheduler.step(step)
 
-                if amp:
+                if not self.use_amp:
+                    self.scheduler.step(step)
+
+                if self.use_amp:
                     with autocast():
                         loss = self.forward(images, masks, texts)
                     self.scaler.scale(loss).backward()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    self.scheduler.step(step)
                 else:
                     loss = self.forward(images, masks, texts)
                     loss.backward()
@@ -129,7 +133,3 @@ class CLIP_Clean_Train:
         loss_i = F.cross_entropy(logits_per_image, labels)
         loss_t = F.cross_entropy(logits_per_text, labels)
         return (loss_i + loss_t) / 2
-
-    def tokenize(self, texts):
-        encoding = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=77)
-        return encoding['input_ids'].to(torch.device(f"cuda:{self.local_rank}"))
