@@ -1,174 +1,184 @@
 import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+import argparse
+import numpy as np
+import faiss
+from dataset.webqa_dataset import WebQAMaskDataset
+import alpha_clip  
+from trainer.a_trainer import CLIP_Clean_Train
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
 
+def custom_collate_fn(batch):
+    batch_images = torch.stack([item['image'] for item in batch])
+    batch_masks = torch.stack([item['mask'] for item in batch])
+    batch_captions = [item['caption'] for item in batch]
+    batch_prompts = [item['prompt'] for item in batch]
+    batch_image_ids = [item['image_id'] for item in batch]
+    batch_mask_info = [item['mask_info'] for item in batch]
 
-if not dist.is_available():
-    raise RuntimeError("torch.distributed is not available")
+    text_input = alpha_clip.tokenize(
+        batch_captions, context_length=77, truncate=True
+    )
 
-if not dist.is_initialized():
-    dist.init_process_group = lambda *args, **kwargs: None
-    dist.get_rank = lambda: 0
-    dist.get_world_size = lambda: 1
+    return {
+        'image': batch_images,
+        'mask': batch_masks,
+        'caption': batch_captions,
+        'prompt': batch_prompts,
+        'image_id': batch_image_ids,
+        'mask_info': batch_mask_info,
+        'text_input': text_input
+    }
+def setup_distributed():
+    return 0  # 单卡训练直接返回 local_rank = 0
 
-from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
+#def setup_distributed(backend="nccl", port="29501"):
+   # if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+     #   rank = int(os.environ["RANK"])
+      #  world_size = int(os.environ["WORLD_SIZE"])
+      #  local_rank = int(os.environ["LOCAL_RANK"])
+   # else:
+     #   rank = 0
+       # world_size = 1
+      #  local_rank = 0
 
-def cosine_lr(optimizer, base_lr, warmup_length, steps, para_gamma=1.0):
-    def lr_lambda(current_step):
-        if current_step < warmup_length:
-            return float(current_step) / float(max(1, warmup_length))
-        return max(
-            0.0,
-            0.5 * (1.0 + torch.cos(
-                torch.tensor((current_step - warmup_length) / (steps - warmup_length) * 3.141592653589793))
-        )) * para_gamma
+   # torch.cuda.set_device(local_rank)
+   # dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+  #  return local_rank
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+class EarlyStopping:
+    def __init__(self, patience=3, verbose=True):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
 
-
-class CLIP_Clean_Train:
-    def __init__(
-        self,
-        model,
-        local_rank=0,
-        lr=4e-5,
-        weigth_decay=0.02,
-        log_scale=4.6052,
-        para_gamma=0.01,
-        exp_name="auto",
-        warmup_length=200,
-        epoch_num=4,
-        subnum=10000,
-        amp=True
-    ):
-        self.local_rank = local_rank
-        torch.cuda.set_device(local_rank)
-
-        self.model = model.float().cuda()
-        self.batch_size = 64 // max(1, dist.get_world_size())
-        self.lr = lr
-        self.epoch_num = epoch_num
-        self.subnum = subnum
-
-        if exp_name == "auto":
-            self.logdir = f"log/webqa/lr={lr}_wd={weigth_decay}_wl={warmup_length}_logs={log_scale}_e{self.epoch_num}"
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.counter = 0
         else:
-            self.logdir = exp_name
-        self.ckptdir = os.path.join(self.logdir, "ckpt")
-        os.makedirs(self.ckptdir, exist_ok=True)
-        self.writer = SummaryWriter(self.logdir)
-
-        #self.model.logit_scale = torch.nn.Parameter(torch.ones([]) * log_scale)
-        self.model.logit_scale = torch.nn.Parameter(
-            torch.ones([], device=f"cuda:{local_rank}", dtype=torch.float32) * log_scale
-        )
+            self.counter += 1
+            if self.verbose:
+                print(f"[EarlyStopping] No improvement. {self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
 
 
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=weigth_decay)
-        self.scheduler = None
+def train_main(args, local_rank):
+    device = torch.device(f"cuda:{local_rank}")
 
-        self.use_amp = amp and torch.cuda.is_available()
-        self.scaler = GradScaler(enabled=self.use_amp)
-        self.best_val_loss = float("inf")
+    full_dataset = WebQAMaskDataset(root_dir=args.data_root, image_size=(336, 336))
+    total_indices = list(range(len(full_dataset)))
+    train_ids, temp_ids = train_test_split(total_indices, test_size=0.2, random_state=42)
+    val_ids, test_ids = train_test_split(temp_ids, test_size=0.5, random_state=42)
 
-        print(f"[INFO] AMP enabled: {self.use_amp}, device: {torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}")
+    train_dataset = Subset(full_dataset, train_ids)
+    val_dataset = Subset(full_dataset, val_ids)
+    test_dataset = Subset(full_dataset, test_ids)
 
-    def train_webqa(self, train_loader, val_loader, early_stopper, resume=False, warmup_length=200):
-        self.scheduler = cosine_lr(
-            self.optimizer, base_lr=self.lr,
-            warmup_length=warmup_length,
-            steps=5000, para_gamma=1.0
-        )
-        step = 0
+    train_sampler = DistributedSampler(train_dataset, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
 
-        for epoch in range(self.epoch_num):
-            self.model.train()
-            if hasattr(train_loader.sampler, 'set_epoch'):
-                train_loader.sampler.set_epoch(epoch)
-            loop = tqdm(train_loader, disable=(dist.get_rank() != 0))
-            epoch_loss = 0.0
+    train_loader = DataLoader(train_dataset,
+                              batch_size=args.batch_size // dist.get_world_size(),
+                              sampler=train_sampler,
+                              num_workers=0,
+                              pin_memory=True,
+                              collate_fn=custom_collate_fn)
 
-            for batch in loop:
-                images = batch['image'].cuda(non_blocking=True)
-                masks = batch['mask'].cuda(non_blocking=True)
-                texts = batch['text_input'].cuda(non_blocking=True)
+    val_loader = DataLoader(val_dataset,
+                            batch_size=args.batch_size // dist.get_world_size(),
+                            sampler=val_sampler,
+                            num_workers=0,
+                            pin_memory=True,
+                            collate_fn=custom_collate_fn)
 
-                self.optimizer.zero_grad()
-                if not self.use_amp:
-                    self.scheduler.step(step)
 
-                if self.use_amp:
-                    with autocast():
-                        loss = self.forward(images, masks, texts)
-                    self.scaler.scale(loss).backward()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.scheduler.step(step)
-                else:
-                    loss = self.forward(images, masks, texts)
-                    loss.backward()
-                    self.optimizer.step()
+    model, _ = alpha_clip.load("ViT-L/14@336px", device=device, lora_adapt=False, rank=-1)
+    model = model.to(device)
 
-                epoch_loss += loss.item()
-                step += 1
-                loop.set_postfix(loss=loss.item())
+    trainer = CLIP_Clean_Train(
+        model=model,
+        local_rank=local_rank,
+        lr=args.lr,
+        weigth_decay=args.weight_decay,
+        log_scale=args.log_scale,
+        para_gamma=args.para_gamma,
+        exp_name=args.exp_name,
+        warmup_length=args.warmup_length,
+        epoch_num=args.epoch_num,
+        amp=args.amp
+    )
 
-                if step % 50 == 0 and dist.get_rank() == 0:
-                    avg_loss = epoch_loss / max(1, step)
-                    self.writer.add_scalar("Loss/train", avg_loss, step)
-                    self.writer.add_scalar("logit_scale", self.model.logit_scale.item(), step)
+    early_stopper = EarlyStopping(patience=args.patience, verbose=True)
 
-                if step % 1000 == 0 and dist.get_rank() == 0:
-                    torch.save(self.model.state_dict(), os.path.join(self.ckptdir, f"model_step{step}.pth"))
+    trainer.train_webqa(train_loader, val_loader, early_stopper, resume=args.resume, warmup_length=args.warmup_length)
 
-            # ===== 验证阶段 =====
-            val_loss = self.evaluate(val_loader)
-            if dist.get_rank() == 0:
-                print(f"[Epoch {epoch+1}] Validation Loss: {val_loss:.4f}")
-                self.writer.add_scalar("Loss/val", val_loss, epoch)
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    torch.save(self.model.state_dict(), os.path.join(self.ckptdir, "best_model.pth"))
 
-            early_stopper(val_loss)
-            if early_stopper.early_stop:
-                print(f"[EarlyStopping] Triggered at epoch {epoch+1}")
-                break
+    if dist.get_rank() == 0:
+        final_ckpt_path = os.path.join(args.data_root, "webqa_alpha_finetune.pth")
+        torch.save(trainer.model.state_dict(), final_ckpt_path)
 
-    def evaluate(self, dataloader):
-        self.model.eval()
-        total_loss = 0.0
-        total_samples = 0
+        #torch.save(trainer.model.module.state_dict(), final_ckpt_path)
+        print(f"Final model saved to {final_ckpt_path}")
 
-        with torch.no_grad():
-            for batch in dataloader:
-                images = batch['image'].cuda(non_blocking=True)
-                masks = batch['mask'].cuda(non_blocking=True)
-                texts = batch['text_input'].cuda(non_blocking=True)
 
-                loss = self.forward(images, masks, texts)
-                total_loss += loss.item() * images.size(0)
-                total_samples += images.size(0)
+def test_main(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, _ = alpha_clip.load("ViT-L/14@336px", device='cuda', lora_adapt=False, rank=-1, dtype=torch.float16)
+    model.load_state_dict(torch.load(args.ckpt, map_location=device))
+    model = model.to(device)
+    model.eval()
 
-        return total_loss / max(1, total_samples)
+    with torch.no_grad():
+        text_input = alpha_clip.tokenize([args.query_text], context_length=77, pad=True, truncate=True).to(device)
+        text_feat = model.encode_text(text_input)
+        text_feat /= text_feat.norm(dim=-1, keepdim=True)
 
-    def forward(self, images, masks, texts):
-        image_features = self.model.encode_image(images, masks)
-        text_features = self.model.encode_text(texts)
+    index = faiss.read_index(args.faiss_index)
+    image_ids = np.load(args.faiss_ids)
 
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    D, I = index.search(text_feat.cpu().numpy(), args.topk)
+    matched_ids = [image_ids[i] for i in I[0]]
 
-        logit_scale = self.model.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logit_scale * text_features @ image_features.t()
+    print("Top-{} results for query: {}".format(args.topk, args.query_text))
+    for i, img_id in enumerate(matched_ids):
+        print(f"{i+1}. Image ID: {img_id}  |  Distance: {D[0][i]:.4f}")
 
-        labels = torch.arange(images.size(0), device=images.device)
-        loss_i = F.cross_entropy(logits_per_image, labels)
-        loss_t = F.cross_entropy(logits_per_text, labels)
-        return (loss_i + loss_t) / 2
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, default="/autodl-tmp/grounded_sam_outputs")
+    parser.add_argument("--query_text", type=str, default="a photo of a street")
+    parser.add_argument("--faiss_index", type=str, default="/autodl-fs/data/featurize/WEBQA/webqa_alpha_clip.index")
+    parser.add_argument("--faiss_ids", type=str, default="/autodl-fs/data/featurize/WEBQA/webqa_alpha_clip.index.ids.npy")
+    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--lr", type=float, default=4e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.02)
+    parser.add_argument("--log_scale", type=float, default=4.6052)
+    parser.add_argument("--para_gamma", type=float, default=0.01)
+    parser.add_argument("--exp_name", type=str, default="auto")
+    parser.add_argument("--warmup_length", type=int, default=200)
+    parser.add_argument("--epoch_num", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--mode", type=str, choices=["train", "test"], default="test")
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
+
+    args = parser.parse_args()
+
+
+    if args.mode == "train":
+        local_rank = setup_distributed()
+        train_main(args, local_rank)
+    else:
+        test_main(args)
+
+if __name__ == "__main__":
+    main()
