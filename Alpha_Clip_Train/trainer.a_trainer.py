@@ -4,6 +4,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
+
+
+if not dist.is_available():
+    raise RuntimeError("torch.distributed is not available")
+
+if not dist.is_initialized():
+    dist.init_process_group = lambda *args, **kwargs: None
+    dist.get_rank = lambda: 0
+    dist.get_world_size = lambda: 1
+
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -53,23 +63,22 @@ class CLIP_Clean_Train:
         os.makedirs(self.ckptdir, exist_ok=True)
         self.writer = SummaryWriter(self.logdir)
 
-        self.model = torch.nn.parallel.DistributedDataParallel(
-            self.model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True
+        #self.model.logit_scale = torch.nn.Parameter(torch.ones([]) * log_scale)
+        self.model.logit_scale = torch.nn.Parameter(
+            torch.ones([], device=f"cuda:{local_rank}", dtype=torch.float32) * log_scale
         )
-        self.model.module.logit_scale = torch.nn.Parameter(torch.ones([]) * log_scale)
+
 
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=weigth_decay)
         self.scheduler = None
 
         self.use_amp = amp and torch.cuda.is_available()
         self.scaler = GradScaler(enabled=self.use_amp)
+        self.best_val_loss = float("inf")
 
         print(f"[INFO] AMP enabled: {self.use_amp}, device: {torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}")
 
-    def train_webqa(self, dataloader, resume=False, warmup_length=200):
+    def train_webqa(self, train_loader, val_loader, early_stopper, resume=False, warmup_length=200):
         self.scheduler = cosine_lr(
             self.optimizer, base_lr=self.lr,
             warmup_length=warmup_length,
@@ -79,9 +88,9 @@ class CLIP_Clean_Train:
 
         for epoch in range(self.epoch_num):
             self.model.train()
-            if hasattr(dataloader.sampler, 'set_epoch'):
-                dataloader.sampler.set_epoch(epoch)
-            loop = tqdm(dataloader, disable=(dist.get_rank() != 0))
+            if hasattr(train_loader.sampler, 'set_epoch'):
+                train_loader.sampler.set_epoch(epoch)
+            loop = tqdm(train_loader, disable=(dist.get_rank() != 0))
             epoch_loss = 0.0
 
             for batch in loop:
@@ -90,7 +99,6 @@ class CLIP_Clean_Train:
                 texts = batch['text_input'].cuda(non_blocking=True)
 
                 self.optimizer.zero_grad()
-
                 if not self.use_amp:
                     self.scheduler.step(step)
 
@@ -113,19 +121,50 @@ class CLIP_Clean_Train:
                 if step % 50 == 0 and dist.get_rank() == 0:
                     avg_loss = epoch_loss / max(1, step)
                     self.writer.add_scalar("Loss/train", avg_loss, step)
-                    self.writer.add_scalar("logit_scale", self.model.module.logit_scale.item(), step)
+                    self.writer.add_scalar("logit_scale", self.model.logit_scale.item(), step)
 
                 if step % 1000 == 0 and dist.get_rank() == 0:
-                    torch.save(self.model.module.state_dict(), os.path.join(self.ckptdir, f"model_step{step}.pth"))
+                    torch.save(self.model.state_dict(), os.path.join(self.ckptdir, f"model_step{step}.pth"))
+
+            # ===== 验证阶段 =====
+            val_loss = self.evaluate(val_loader)
+            if dist.get_rank() == 0:
+                print(f"[Epoch {epoch+1}] Validation Loss: {val_loss:.4f}")
+                self.writer.add_scalar("Loss/val", val_loss, epoch)
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    torch.save(self.model.state_dict(), os.path.join(self.ckptdir, "best_model.pth"))
+
+            early_stopper(val_loss)
+            if early_stopper.early_stop:
+                print(f"[EarlyStopping] Triggered at epoch {epoch+1}")
+                break
+
+    def evaluate(self, dataloader):
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+
+        with torch.no_grad():
+            for batch in dataloader:
+                images = batch['image'].cuda(non_blocking=True)
+                masks = batch['mask'].cuda(non_blocking=True)
+                texts = batch['text_input'].cuda(non_blocking=True)
+
+                loss = self.forward(images, masks, texts)
+                total_loss += loss.item() * images.size(0)
+                total_samples += images.size(0)
+
+        return total_loss / max(1, total_samples)
 
     def forward(self, images, masks, texts):
-        image_features = self.model.module.encode_image(images, masks)
-        text_features = self.model.module.encode_text(texts)
+        image_features = self.model.encode_image(images, masks)
+        text_features = self.model.encode_text(texts)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        logit_scale = self.model.module.logit_scale.exp()
+        logit_scale = self.model.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
         logits_per_text = logit_scale * text_features @ image_features.t()
 
