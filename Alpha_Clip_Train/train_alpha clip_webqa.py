@@ -119,13 +119,32 @@ def train_main(args, local_rank):
 
     trainer.train_webqa(train_loader, val_loader, early_stopper, resume=args.resume, warmup_length=args.warmup_length)
 
-
     if dist.get_rank() == 0:
+
         final_ckpt_path = os.path.join(args.data_root, "webqa_alpha_finetune.pth")
         torch.save(trainer.model.state_dict(), final_ckpt_path)
+        print(f"Final model saved to {final_ckpt_path}")
+
+
+        split_dir = os.path.join(args.data_root, "splits")
+        os.makedirs(split_dir, exist_ok=True)
+
+        test_ids_path = os.path.join(split_dir, "test_ids.txt")
+        test_caps_path = os.path.join(split_dir, "test_caps.txt")
+
+        with open(test_ids_path, "w") as f_id, open(test_caps_path, "w") as f_cap:
+            for idx in test_ids:
+                f_id.write(full_dataset.image_ids[idx] + "\n")
+                f_cap.write(full_dataset.captions[idx] + "\n")
+
+        print(f"[Split Saved] Test set saved to {test_ids_path} and {test_caps_path}")
+
+    #if dist.get_rank() == 0:
+        #final_ckpt_path = os.path.join(args.data_root, "webqa_alpha_finetune.pth")
+        #torch.save(trainer.model.state_dict(), final_ckpt_path)
 
         #torch.save(trainer.model.module.state_dict(), final_ckpt_path)
-        print(f"Final model saved to {final_ckpt_path}")
+       # print(f"Final model saved to {final_ckpt_path}")
 
 
 def test_main(args):
@@ -152,10 +171,10 @@ def test_main(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, default="/autodl-tmp/grounded_sam_outputs")
+    parser.add_argument("--data_root", type=str, default="/root/autodl-tmp/grounded_sam_outputs")
     parser.add_argument("--query_text", type=str, default="a photo of a street")
-    parser.add_argument("--faiss_index", type=str, default="/autodl-fs/data/featurize/WEBQA/webqa_alpha_clip.index")
-    parser.add_argument("--faiss_ids", type=str, default="/autodl-fs/data/featurize/WEBQA/webqa_alpha_clip.index.ids.npy")
+    parser.add_argument("--faiss_index", type=str, default="/root/autodl-fs/data/featurize/WEBQA/webqa_alpha_clip.index")
+    parser.add_argument("--faiss_ids", type=str, default="/root/autodl-fs/data/featurize/WEBQA/webqa_alpha_clip.index.ids.npy")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--lr", type=float, default=4e-5)
