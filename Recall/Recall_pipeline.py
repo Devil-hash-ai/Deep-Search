@@ -15,24 +15,32 @@ import alpha_clip
 from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
 
 
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="WebQA + CLIP + Alpha-CLIP + SAM Pipeline")
-
-    parser.add_argument('--webqa_dir', type=str, default="/home/featurize/WEBQA", help="Root directory of WebQA")
+    
+    parser.add_argument('--webqa_dir', type=str, default="/root/autodl-tmp/rag/WEBQA", help="Root directory of WebQA")
     parser.add_argument('--image_ids_file', type=str, default="webqa_image_ids/image_ids.txt", help="Relative path to image IDs")
     parser.add_argument('--captions_file', type=str, default="webqa_captions/captions.txt", help="Relative path to captions")
-    parser.add_argument('--image_subdir', type=str, default="webqa_images", help="Subdirectory for images")
+    parser.add_argument('--image_subdir', type=str, default="webqa_train", help="Subdirectory for images")
 
     parser.add_argument('--faiss_index_name', type=str, default="webqa_clip.index", help="FAISS index file name")
-    parser.add_argument('--alpha_ckpt', type=str, default="/home/featurize/new work/Clip/clip_l14_336_grit_20m_4xe.pth", help="Alpha-CLIP checkpoint")
-    parser.add_argument('--sam_ckpt', type=str, default="/home/featurize/new work/GroundingDINO/checkpoints/sam_vit_h_4b8939.pth", help="SAM checkpoint")
-    parser.add_argument('--precomputed_mask_dir', type=str, default="/home/featurize/WEBQA/grounded_sam_outputs", help="Directory containing precomputed mask.json files")
+    parser.add_argument('--faiss_ids_name', type=str, default="webqa_clip.index.ids.npy", help="FAISS ID file name")
+    parser.add_argument('--clip_model_path', type=str, default="/root/autodl-tmp/WEBQA/clip-finetuned", help="Path to local fine-tuned CLIP model")
 
-    parser.add_argument('--sample_size', type=int, default=100, help="Number of samples to evaluate")
+    parser.add_argument('--alpha_ckpt', type=str, default="/autodl-tmp/WEBQA/webqa_alpha_finetune.pth", help="Alpha-CLIP checkpoint")
+    parser.add_argument('--sam_ckpt', type=str, default="xxxxxxxxxxx", help="SAM checkpoint")
+    parser.add_argument('--precomputed_mask_dir', type=str, default="/autodl-tmp/WEBQA/grounded_sam_prompts", help="Directory containing precomputed mask.json files")
+
+    parser.add_argument('--sample_size', type=int, default=-1, help="Number of samples to evaluate; use -1 for full test set")
     parser.add_argument('--top_k', type=int, default=5, help="Top-K images to rerank")
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help="Device to use")
+    parser.add_argument('--alpha_model_type', type=str, default="ViT-L/14@336px", help="Alpha-CLIP model type for loading")
 
     return parser.parse_args()
+
+
 
 def build_or_load_faiss(image_ids, image_dir, faiss_index_path, faiss_ids_path,
                         clip_model, clip_processor, device):
@@ -197,29 +205,47 @@ def sam_segment_full_image(image_pil, max_masks=30):
 def main():
     args = parse_args()
 
-    image_ids_path = os.path.join(args.webqa_dir, args.image_ids_file)
-    captions_path = os.path.join(args.webqa_dir, args.captions_file)
+    #image_ids_path = os.path.join(args.webqa_dir, args.image_ids_file)
+    #captions_path = os.path.join(args.webqa_dir, args.captions_file)
+    image_ids_path = os.path.join(args.webqa_dir, "splits", "test_ids.txt")
+    captions_path  = os.path.join(args.webqa_dir, "splits", "test_caps.txt")
+
     image_dir = os.path.join(args.webqa_dir, args.image_subdir)
     faiss_index_path = os.path.join(args.webqa_dir, args.faiss_index_name)
     faiss_ids_path = faiss_index_path + ".ids.npy"
 
+    #with open(image_ids_path, 'r') as f:
+        #image_ids = [line.strip() for line in f.readlines()]
+    #with open(captions_path, 'r') as f:
+        #all_lines = f.readlines()
+    #queries = [line.strip().split('\t') for line in random.sample(all_lines, args.sample_size) if '\t' in line]
+
     with open(image_ids_path, 'r') as f:
-        image_ids = [line.strip() for line in f.readlines()]
+        image_ids = [line.strip() for line in f]
     with open(captions_path, 'r') as f:
-        all_lines = f.readlines()
-    queries = [line.strip().split('\t') for line in random.sample(all_lines, args.sample_size) if '\t' in line]
+        captions = [line.strip() for line in f]
+    assert len(image_ids) == len(captions), "Mismatch between test_ids and captions"
+    queries = list(zip(image_ids, captions))
 
     print("[INFO] Loading models...")
     faiss_index = faiss.read_index(faiss_index_path)
 
     id_mapping = np.load(faiss_ids_path, allow_pickle=True).tolist()
 
-    clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(args.device)
-    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
+    clip_model     = CLIPModel.from_pretrained(args.clip_model_path).to(args.device)
+    clip_processor = CLIPProcessor.from_pretrained(args.clip_model_path)
+
+    #clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(args.device)
+    #clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+
+    #alpha_model, alpha_preprocess = alpha_clip.load(
+        #"ViT-L/14@336px", alpha_vision_ckpt_pth=args.alpha_ckpt, device=args.device
+    #)
     alpha_model, alpha_preprocess = alpha_clip.load(
-        "ViT-L/14@336px", alpha_vision_ckpt_pth=args.alpha_ckpt, device=args.device
+        args.alpha_model_type, alpha_vision_ckpt_pth=args.alpha_ckpt, device=args.device
     )
+
 
     correct = 0
     for gt_image_id, query_text in tqdm(queries, desc="Running Evaluation"):
